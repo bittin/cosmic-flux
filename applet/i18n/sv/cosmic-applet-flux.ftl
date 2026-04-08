@@ -1,0 +1,17 @@
+app-title = Cosmic Flux
+source-file = Bakgrundsfil
+no-file-selected = Ingen fil vald
+playback = Uppspelning
+play = Spela
+pause = Paus
+stop = Stopp
+stop-wallpaper = Stoppa bakgrund
+fit-mode = Visningsläge
+fit-zoom = Zooma (beskär för att fylla)
+fit-fit = Passa (letterbox)
+fit-stretch = Sträck ut
+span-mode = Spänn över skärmar
+fps-cap = FPS-gräns
+error = Fel
+daemon-unavailable = Daemonen körs inte
+start-daemon = Starta
