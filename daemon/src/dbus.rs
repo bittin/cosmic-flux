@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 //! D-Bus server interface for the daemon.
-//! Serves `com.system76.CosmicFlux1` on the session bus.
+//! Serves `io.github.franz_net.CosmicExtFlux1` on the session bus.
 
 use crate::wayland::{Command, DaemonState};
 use anyhow::Result;
@@ -36,7 +36,7 @@ struct WallpaperInterface {
     state: Arc<Mutex<DaemonState>>,
 }
 
-#[interface(name = "com.system76.CosmicFlux1")]
+#[interface(name = "io.github.franz_net.CosmicExtFlux1")]
 impl WallpaperInterface {
     async fn set_source(&self, path: String) -> zbus::fdo::Result<()> {
         let validated = validate_source_path(&path)
@@ -87,9 +87,10 @@ impl WallpaperInterface {
     }
 
     async fn set_fps_cap(&self, fps: u32) -> zbus::fdo::Result<()> {
-        if !(5..=60).contains(&fps) {
+        // 0 = follow source framerate
+        if fps != 0 && !(5..=60).contains(&fps) {
             return Err(zbus::fdo::Error::InvalidArgs(
-                "FPS cap must be between 5 and 60".to_string(),
+                "FPS cap must be 0 (auto) or between 5 and 60".to_string(),
             ));
         }
         self.command_tx
@@ -190,13 +191,13 @@ pub async fn serve(
     let conn = Connection::session().await?;
 
     conn.object_server()
-        .at("/com/system76/CosmicFlux", iface)
+        .at("/io/github/franz_net/CosmicExtFlux", iface)
         .await?;
 
-    conn.request_name("com.system76.CosmicFlux1")
+    conn.request_name("io.github.franz_net.CosmicExtFlux1")
         .await?;
 
-    tracing::info!("D-Bus interface active at com.system76.CosmicFlux1");
+    tracing::info!("D-Bus interface active at io.github.franz_net.CosmicExtFlux1");
 
     std::future::pending::<()>().await;
     unreachable!()
