@@ -5,7 +5,7 @@ use crate::fl;
 use ashpd::desktop::file_chooser::{FileFilter, SelectedFiles};
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::{window::Id, Limits, Subscription};
-use cosmic::iced_winit::commands::popup::{destroy_popup, get_popup};
+use cosmic::surface::action::{app_popup, destroy_popup};
 use cosmic::prelude::*;
 use cosmic::widget;
 use futures_util::SinkExt;
@@ -25,6 +25,9 @@ pub enum Message {
     SetSpanMode(bool),
     SetFpsCap(u32),
     SetFpsAuto(bool),
+    SetPauseOnFullscreen(bool),
+    SetPauseOnMaximized(bool),
+    SetPauseOnBattery(bool),
     UpdateConfig(Config),
     DaemonState { playing: bool, error: Option<String>, cpu: f64, memory: f64, fps: f64, source_fps: f64 },
     CommandSent,
@@ -121,6 +124,12 @@ impl cosmic::Application for AppModel {
 
     // Popup window contents
     fn view_window(&self, _id: Id) -> Element<'_, Message> {
+        tracing::debug!(
+            "view_window: rendering popup (playing={}, available={}, fps_auto={})",
+            self.daemon_playing,
+            self.daemon_available,
+            self.config.fps_cap == 0
+        );
         // File picker row
         let source_label = if self.config.source_path.is_empty() {
             fl!("no-file-selected")
@@ -169,8 +178,6 @@ impl cosmic::Application for AppModel {
         );
 
         let mut content = widget::list_column()
-            .padding(5)
-            .spacing(0)
             .add(file_row)
             .add(playback_row);
 
@@ -214,6 +221,30 @@ impl cosmic::Application for AppModel {
         );
         content = content.add(span_row);
 
+        // Pause-on-fullscreen toggle (issue #13)
+        let fullscreen_row = widget::settings::item(
+            fl!("pause-on-fullscreen"),
+            widget::toggler(self.config.pause_on_fullscreen)
+                .on_toggle(Message::SetPauseOnFullscreen),
+        );
+        content = content.add(fullscreen_row);
+
+        // Optionally also pause on maximized windows (opt-in)
+        let maximized_row = widget::settings::item(
+            fl!("pause-on-maximized"),
+            widget::toggler(self.config.pause_on_maximized)
+                .on_toggle(Message::SetPauseOnMaximized),
+        );
+        content = content.add(maximized_row);
+
+        // Pause on battery power (opt-in, issue #1)
+        let battery_row = widget::settings::item(
+            fl!("pause-on-battery"),
+            widget::toggler(self.config.pause_on_battery)
+                .on_toggle(Message::SetPauseOnBattery),
+        );
+        content = content.add(battery_row);
+
         // Show performance stats when playing
         if self.daemon_playing {
             let stats_text = format!(
@@ -244,9 +275,9 @@ impl cosmic::Application for AppModel {
             self.core()
                 .watch_config::<Config>(APP_ID)
                 .map(|update| Message::UpdateConfig(update.config)),
-            Subscription::run_with_id(
+            Subscription::run_with(
                 std::any::TypeId::of::<DaemonPoll>(),
-                cosmic::iced::stream::channel(4, move |mut sender| async move {
+                |_: &std::any::TypeId| cosmic::iced::stream::channel::<Message>(4, move |mut sender: cosmic::iced::futures::channel::mpsc::Sender<Message>| async move {
                     loop {
                         match poll_daemon_state().await {
                             Ok((playing, error, cpu, memory, fps, source_fps)) => {
@@ -268,30 +299,46 @@ impl cosmic::Application for AppModel {
     fn update(&mut self, message: Message) -> Task<cosmic::Action<Message>> {
         match message {
             Message::TogglePopup => {
-                return if let Some(p) = self.popup.take() {
+                let action = if let Some(p) = self.popup.take() {
+                    tracing::debug!("TogglePopup: destroying popup {p:?}");
                     destroy_popup(p)
                 } else {
-                    let Some(main_id) = self.core.main_window_id() else {
-                        return Task::none();
-                    };
-                    let new_id = Id::unique();
-                    self.popup.replace(new_id);
-                    let mut popup_settings = self.core.applet.get_popup_settings(
-                        main_id,
-                        new_id,
-                        None,
-                        None,
-                        None,
-                    );
-                    popup_settings.positioner.size_limits = Limits::NONE
-                        .max_width(372.0)
-                        .min_width(300.0)
-                        .min_height(200.0)
-                        .max_height(600.0);
-                    get_popup(popup_settings)
+                    tracing::debug!("TogglePopup: creating popup");
+                    app_popup::<AppModel>(
+                        |state: &mut AppModel| {
+                            let main_id =
+                                state.core.main_window_id().unwrap_or(Id::NONE);
+                            let new_id = Id::unique();
+                            state.popup = Some(new_id);
+                            let mut popup_settings = state.core.applet.get_popup_settings(
+                                main_id,
+                                new_id,
+                                None,
+                                None,
+                                None,
+                            );
+                            popup_settings.positioner.size_limits = Limits::NONE
+                                .max_width(372.0)
+                                .min_width(300.0)
+                                .min_height(200.0)
+                                // Headroom for the full set of rows; a too-low
+                                // ceiling makes the popup overflow and the surface
+                                // races on configure (xdg_surface
+                                // unconfigured_buffer crash).
+                                .max_height(900.0);
+                            popup_settings
+                        },
+                        Some(Box::new(|state: &AppModel| {
+                            state.view_window(Id::NONE).map(cosmic::Action::App)
+                        })),
+                    )
                 };
+                return cosmic::task::message(cosmic::Action::Cosmic(
+                    cosmic::app::Action::Surface(action),
+                ));
             }
             Message::PopupClosed(id) => {
+                tracing::debug!("PopupClosed({id:?}) (current popup: {:?})", self.popup);
                 if self.popup.as_ref() == Some(&id) {
                     self.popup = None;
                 }
@@ -301,6 +348,18 @@ impl cosmic::Application for AppModel {
                 self.config = config;
             }
             Message::DaemonState { playing, error, cpu, memory, fps, source_fps } => {
+                // A change in `playing`/`available` adds or removes popup rows
+                // (stats / start-daemon), which resizes an open popup — log it
+                // so a crash can be correlated with a content-height change.
+                if (playing != self.daemon_playing || !self.daemon_available)
+                    && self.popup.is_some()
+                {
+                    tracing::debug!(
+                        "DaemonState changed while popup open (playing {} -> {}); popup will resize",
+                        self.daemon_playing,
+                        playing
+                    );
+                }
                 self.daemon_playing = playing;
                 self.daemon_error = error.map(|e| {
                     if e.len() > 256 {
@@ -425,11 +484,35 @@ impl cosmic::Application for AppModel {
                     |_| cosmic::Action::App(Message::CommandSent),
                 );
             }
+            Message::SetPauseOnFullscreen(enabled) => {
+                self.config.pause_on_fullscreen = enabled;
+                self.save_config();
+                return Task::perform(
+                    send_command(DaemonCommand::SetPauseOnFullscreen(enabled)),
+                    |_| cosmic::Action::App(Message::CommandSent),
+                );
+            }
+            Message::SetPauseOnMaximized(enabled) => {
+                self.config.pause_on_maximized = enabled;
+                self.save_config();
+                return Task::perform(
+                    send_command(DaemonCommand::SetPauseOnMaximized(enabled)),
+                    |_| cosmic::Action::App(Message::CommandSent),
+                );
+            }
+            Message::SetPauseOnBattery(enabled) => {
+                self.config.pause_on_battery = enabled;
+                self.save_config();
+                return Task::perform(
+                    send_command(DaemonCommand::SetPauseOnBattery(enabled)),
+                    |_| cosmic::Action::App(Message::CommandSent),
+                );
+            }
         }
         Task::none()
     }
 
-    fn style(&self) -> Option<cosmic::iced_runtime::Appearance> {
+    fn style(&self) -> Option<cosmic::iced::theme::Style> {
         Some(cosmic::applet::style())
     }
 }
@@ -489,6 +572,9 @@ enum DaemonCommand {
     SetFitMode(String),
     SetSpanMode(bool),
     SetFpsCap(u32),
+    SetPauseOnFullscreen(bool),
+    SetPauseOnMaximized(bool),
+    SetPauseOnBattery(bool),
 }
 
 async fn send_command(cmd: DaemonCommand) -> Result<(), anyhow::Error> {
@@ -501,6 +587,9 @@ async fn send_command(cmd: DaemonCommand) -> Result<(), anyhow::Error> {
         DaemonCommand::SetFitMode(m) => proxy.set_fit_mode(&m).await?,
         DaemonCommand::SetSpanMode(e) => proxy.set_span_mode(e).await?,
         DaemonCommand::SetFpsCap(f) => proxy.set_fps_cap(f).await?,
+        DaemonCommand::SetPauseOnFullscreen(e) => proxy.set_pause_on_fullscreen(e).await?,
+        DaemonCommand::SetPauseOnMaximized(e) => proxy.set_pause_on_maximized(e).await?,
+        DaemonCommand::SetPauseOnBattery(e) => proxy.set_pause_on_battery(e).await?,
     }
     Ok(())
 }

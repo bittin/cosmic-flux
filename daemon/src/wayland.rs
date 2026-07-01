@@ -21,6 +21,12 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
+use cosmic_client_toolkit::{
+    cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::State as ToplevelState,
+    delegate_toplevel_info,
+    toplevel_info::{ToplevelInfoHandler, ToplevelInfoState},
+    wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1,
+};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -67,6 +73,44 @@ pub enum Command {
     SetFitMode(FitMode),
     SetSpanMode(bool),
     SetFpsCap(u32),
+    SetPauseOnFullscreen(bool),
+    SetPauseOnMaximized(bool),
+    SetPauseOnBattery(bool),
+    /// Raw on-battery state from the UPower monitor (not a user setting).
+    SetOnBattery(bool),
+}
+
+/// What the user last explicitly asked for. Distinct from the *effective*
+/// playback state, which also depends on auto-pause reasons below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserIntent {
+    Playing,
+    Paused,
+    Stopped,
+}
+
+/// Reasons the daemon auto-pauses playback independently of the user's intent.
+/// Effective playback is "user wants to play AND no auto-pause reason is active".
+#[derive(Debug, Default, Clone, Copy)]
+struct AutoPause {
+    /// A fullscreen (or, if opted in, maximized) toplevel is covering the
+    /// screen (issue #13).
+    covered: bool,
+    /// The system is on battery power and pause-on-battery is enabled (issue #1).
+    on_battery: bool,
+}
+
+impl AutoPause {
+    fn any(&self) -> bool {
+        self.covered || self.on_battery
+    }
+}
+
+/// Effective playback decision: play only when the user wants to play and no
+/// auto-pause reason is active. Pure (no `self`) so the arbitration that drives
+/// the whole auto-pause feature set can be unit-tested directly.
+fn should_play(user_intent: UserIntent, auto_pause: AutoPause) -> bool {
+    user_intent == UserIntent::Playing && !auto_pause.any()
 }
 
 /// Shared readable state published by the daemon (read by D-Bus properties).
@@ -121,8 +165,22 @@ struct WallpaperRenderer {
     command_rx: std::sync::mpsc::Receiver<Command>,
 
     pipeline: Option<crate::decoder::DecoderPipeline>,
+    /// Effective playback state: pipeline is PLAYING and the frame-callback
+    /// chain is alive. Derived from `user_intent` + `auto_pause`.
     is_playing: bool,
     exit: bool,
+
+    // Auto-pause arbitration (shared by issue #13 and, later, issue #1)
+    user_intent: UserIntent,
+    auto_pause: AutoPause,
+    pause_on_fullscreen: bool,
+    pause_on_maximized: bool,
+    pause_on_battery: bool,
+    /// Raw on-battery state reported by UPower (independent of the setting).
+    system_on_battery: bool,
+    /// Toplevel-info protocol state; `None` if the compositor doesn't expose it,
+    /// in which case fullscreen detection is silently disabled.
+    toplevel_info: Option<ToplevelInfoState>,
 
     // Cross-fade state
     prev_frame: Option<Vec<u8>>,
@@ -183,6 +241,13 @@ pub fn run(
         pipeline: None,
         is_playing: false,
         exit: false,
+        user_intent: UserIntent::Playing,
+        auto_pause: AutoPause::default(),
+        pause_on_fullscreen: true,
+        pause_on_maximized: false,
+        pause_on_battery: false,
+        system_on_battery: false,
+        toplevel_info: None,
         prev_frame: None,
         prev_decode_w: 0,
         prev_decode_h: 0,
@@ -198,6 +263,16 @@ pub fn run(
         cached_bb: ((0, 0), (0, 0)),
         bb_dirty: true,
     };
+
+    // Bind the toplevel-info protocol for fullscreen detection (issue #13).
+    // Returns None if the compositor doesn't advertise ext-foreign-toplevel-list,
+    // in which case auto-pause-on-fullscreen silently does nothing.
+    renderer.toplevel_info = ToplevelInfoState::try_new(&renderer.registry_state, &qh);
+    if renderer.toplevel_info.is_some() {
+        tracing::info!("toplevel-info bound; auto-pause-on-fullscreen available");
+    } else {
+        tracing::warn!("toplevel-info unavailable; auto-pause-on-fullscreen disabled");
+    }
 
     tracing::info!("Entering Wayland event loop");
 
@@ -742,6 +817,8 @@ impl WallpaperRenderer {
                 if let Some(p) = self.pipeline.take() {
                     p.stop();
                 }
+                // Selecting a source implies the user wants it playing.
+                self.user_intent = UserIntent::Playing;
                 if self.decode_width == 0 || self.decode_height == 0 {
                     tracing::warn!("Cannot set source before any output is configured");
                     // Store the path so it starts when outputs configure
@@ -761,15 +838,22 @@ impl WallpaperRenderer {
                     self.fps_cap,
                 ) {
                     Ok(pipeline) => {
-                        pipeline.play();
-                        self.is_playing = true;
+                        let desired = self.desired_playing();
+                        if desired {
+                            pipeline.play();
+                        } else {
+                            pipeline.pause();
+                        }
+                        self.is_playing = desired;
                         if let Ok(mut state) = self.daemon_state.lock() {
                             state.source_path = path;
-                            state.playing = true;
+                            state.playing = desired;
                             state.error = None;
                         }
                         self.pipeline = Some(pipeline);
-                        self.request_frame(qh);
+                        if desired {
+                            self.request_frame(qh);
+                        }
                     }
                     Err(e) => {
                         tracing::error!("Failed to create decoder pipeline: {e}");
@@ -780,14 +864,10 @@ impl WallpaperRenderer {
                 }
             }
             Command::Play => {
-                if let Some(p) = &self.pipeline {
-                    // Resume paused pipeline
-                    p.play();
-                    self.is_playing = true;
-                    if let Ok(mut state) = self.daemon_state.lock() {
-                        state.playing = true;
-                    }
-                    self.request_frame(qh);
+                self.user_intent = UserIntent::Playing;
+                if self.pipeline.is_some() {
+                    // Resume existing pipeline (subject to auto-pause reasons)
+                    self.reconcile_playback(qh);
                 } else {
                     // Pipeline was destroyed (Stop) — recreate from saved source
                     let source = self
@@ -802,15 +882,11 @@ impl WallpaperRenderer {
                 }
             }
             Command::Pause => {
-                if let Some(p) = &self.pipeline {
-                    p.pause();
-                    self.is_playing = false;
-                    if let Ok(mut state) = self.daemon_state.lock() {
-                        state.playing = false;
-                    }
-                }
+                self.user_intent = UserIntent::Paused;
+                self.reconcile_playback(qh);
             }
             Command::Stop => {
+                self.user_intent = UserIntent::Stopped;
                 if let Some(p) = self.pipeline.take() {
                     p.stop();
                 }
@@ -848,6 +924,103 @@ impl WallpaperRenderer {
                 }
                 self.recreate_pipeline_if_active();
             }
+            Command::SetPauseOnFullscreen(enabled) => {
+                self.pause_on_fullscreen = enabled;
+                // Recompute against current toplevels (handles enable and disable).
+                self.update_window_pause(qh);
+            }
+            Command::SetPauseOnMaximized(enabled) => {
+                self.pause_on_maximized = enabled;
+                self.update_window_pause(qh);
+            }
+            Command::SetPauseOnBattery(enabled) => {
+                self.pause_on_battery = enabled;
+                self.update_battery_pause(qh);
+            }
+            Command::SetOnBattery(on_battery) => {
+                self.system_on_battery = on_battery;
+                self.update_battery_pause(qh);
+            }
+        }
+    }
+
+    // --- Auto-pause arbitration ---
+
+    /// Effective playback: the user wants to play and nothing is auto-pausing.
+    fn desired_playing(&self) -> bool {
+        should_play(self.user_intent, self.auto_pause)
+    }
+
+    /// Drive an existing pipeline + the frame-callback chain to match
+    /// `desired_playing()`. No-op when already in the desired state, so it's
+    /// safe to call on every intent/auto-pause change without doubling the
+    /// frame-callback chain.
+    fn reconcile_playback(&mut self, qh: &QueueHandle<Self>) {
+        let desired = self.desired_playing();
+        if desired == self.is_playing {
+            return;
+        }
+        if let Some(p) = &self.pipeline {
+            if desired {
+                p.play();
+            } else {
+                p.pause();
+            }
+        }
+        self.is_playing = desired;
+        if let Ok(mut state) = self.daemon_state.lock() {
+            state.playing = desired;
+        }
+        if desired {
+            self.request_frame(qh);
+        } else if self.auto_pause.any() {
+            let mut reasons = Vec::new();
+            if self.auto_pause.covered {
+                reasons.push("a fullscreen/maximized window");
+            }
+            if self.auto_pause.on_battery {
+                reasons.push("on battery power");
+            }
+            tracing::info!("Auto-paused: {}", reasons.join(" + "));
+        }
+    }
+
+    /// Recompute the "covering window" auto-pause reason from current toplevels
+    /// and reconcile if it changed. Pauses on any fullscreen toplevel, plus any
+    /// maximized toplevel when that option is enabled.
+    ///
+    /// Granularity is global by design: a match on ANY output pauses ALL
+    /// outputs. The wallpaper is a single shared decode pipeline, so a
+    /// partially-covered multi-monitor setup would keep decoding regardless —
+    /// global pause is the only behavior that actually saves CPU/battery. The
+    /// trade-off (a visible wallpaper on an uncovered monitor also freezes) is
+    /// intentional.
+    fn update_window_pause(&mut self, qh: &QueueHandle<Self>) {
+        let pause_on_fullscreen = self.pause_on_fullscreen;
+        let pause_on_maximized = self.pause_on_maximized;
+        let covered = self
+            .toplevel_info
+            .as_ref()
+            .map(|ti| {
+                ti.toplevels().any(|t| {
+                    (pause_on_fullscreen && t.state.contains(&ToplevelState::Fullscreen))
+                        || (pause_on_maximized && t.state.contains(&ToplevelState::Maximized))
+                })
+            })
+            .unwrap_or(false);
+        if covered != self.auto_pause.covered {
+            self.auto_pause.covered = covered;
+            self.reconcile_playback(qh);
+        }
+    }
+
+    /// Recompute the on-battery auto-pause reason and reconcile if it changed.
+    /// Pauses only when the system is on battery AND the setting is enabled.
+    fn update_battery_pause(&mut self, qh: &QueueHandle<Self>) {
+        let on_battery = self.pause_on_battery && self.system_on_battery;
+        if on_battery != self.auto_pause.on_battery {
+            self.auto_pause.on_battery = on_battery;
+            self.reconcile_playback(qh);
         }
     }
 
@@ -950,8 +1123,10 @@ impl WallpaperRenderer {
             self.fps_cap,
         ) {
             Ok(pipeline) => {
-                if self.is_playing {
+                if self.desired_playing() {
                     pipeline.play();
+                } else {
+                    pipeline.pause();
                 }
                 self.pipeline = Some(pipeline);
             }
@@ -988,13 +1163,20 @@ impl WallpaperRenderer {
             self.fps_cap,
         ) {
             Ok(pipeline) => {
-                pipeline.play();
-                self.is_playing = true;
+                let desired = self.desired_playing();
+                if desired {
+                    pipeline.play();
+                } else {
+                    pipeline.pause();
+                }
+                self.is_playing = desired;
                 if let Ok(mut state) = self.daemon_state.lock() {
-                    state.playing = true;
+                    state.playing = desired;
                 }
                 self.pipeline = Some(pipeline);
-                self.request_frame(qh);
+                if desired {
+                    self.request_frame(qh);
+                }
             }
             Err(e) => tracing::error!("Failed to start deferred pipeline: {e}"),
         }
@@ -1420,16 +1602,116 @@ impl ShmHandler for WallpaperRenderer {
     }
 }
 
+impl ToplevelInfoHandler for WallpaperRenderer {
+    fn toplevel_info_state(&mut self) -> &mut ToplevelInfoState {
+        // Only ever called by the protocol dispatch, which exists only when
+        // `toplevel_info` was successfully bound.
+        self.toplevel_info
+            .as_mut()
+            .expect("toplevel_info dispatched without bound state")
+    }
+
+    fn new_toplevel(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _toplevel: &ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+    ) {
+        self.update_window_pause(qh);
+    }
+
+    fn update_toplevel(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _toplevel: &ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+    ) {
+        self.update_window_pause(qh);
+    }
+
+    fn toplevel_closed(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _toplevel: &ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+    ) {
+        self.update_window_pause(qh);
+    }
+}
+
 delegate_compositor!(WallpaperRenderer);
 delegate_output!(WallpaperRenderer);
 delegate_shm!(WallpaperRenderer);
 delegate_seat!(WallpaperRenderer);
 delegate_layer!(WallpaperRenderer);
 delegate_registry!(WallpaperRenderer);
+delegate_toplevel_info!(WallpaperRenderer);
 
 impl ProvidesRegistryState for WallpaperRenderer {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
     registry_handlers![OutputState, SeatState];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ap(covered: bool, on_battery: bool) -> AutoPause {
+        AutoPause {
+            covered,
+            on_battery,
+        }
+    }
+
+    #[test]
+    fn autopause_any_is_or_of_reasons() {
+        assert!(!ap(false, false).any());
+        assert!(ap(true, false).any());
+        assert!(ap(false, true).any());
+        assert!(ap(true, true).any());
+    }
+
+    #[test]
+    fn plays_only_when_playing_intent_and_no_autopause() {
+        assert!(should_play(UserIntent::Playing, ap(false, false)));
+        assert!(!should_play(UserIntent::Paused, ap(false, false)));
+        assert!(!should_play(UserIntent::Stopped, ap(false, false)));
+    }
+
+    #[test]
+    fn any_autopause_reason_overrides_play_intent() {
+        // A fullscreen/maximized window, on-battery, or both must stop playback
+        // even when the user intends to play.
+        assert!(!should_play(UserIntent::Playing, ap(true, false)));
+        assert!(!should_play(UserIntent::Playing, ap(false, true)));
+        assert!(!should_play(UserIntent::Playing, ap(true, true)));
+    }
+
+    #[test]
+    fn manual_pause_holds_when_autopause_clears() {
+        // Manual pause takes precedence: clearing every auto-pause reason must
+        // not resume a user-paused or user-stopped wallpaper.
+        assert!(!should_play(UserIntent::Paused, ap(false, false)));
+        assert!(!should_play(UserIntent::Stopped, ap(false, false)));
+    }
+
+    #[test]
+    fn fit_mode_str_roundtrip() {
+        for (s, m) in [
+            ("zoom", FitMode::Zoom),
+            ("fit", FitMode::Fit),
+            ("stretch", FitMode::Stretch),
+        ] {
+            assert_eq!(FitMode::from_str(s), m);
+            assert_eq!(m.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn fit_mode_unknown_defaults_to_zoom() {
+        assert_eq!(FitMode::from_str("bogus"), FitMode::Zoom);
+        assert_eq!(FitMode::from_str(""), FitMode::Zoom);
+    }
 }

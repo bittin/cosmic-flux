@@ -1,3 +1,40 @@
+cosmic-ext-flux (3.1.1-1) unstable; urgency=medium
+
+  * Fix the applet popup crash that persisted on some systems (issue #15).
+    On certain hardware the applet died on popup open with an xdg_surface
+    "unconfigured_buffer" protocol error regardless of popup height, so the
+    v3.1.0 height-ceiling fix did not cover it. The cause was an upstream
+    libcosmic bug in the pinned revision; libcosmic is bumped to a newer
+    revision that resolves it, and the applet popup code is migrated to
+    libcosmic's current surface-action API. No user-facing behaviour changes.
+
+ -- Franz <cosmic-flux-info@franz-net.dev>  Sun, 28 Jun 2026 12:00:00 +0000
+
+cosmic-ext-flux (3.1.0-1) unstable; urgency=medium
+
+  * Optionally pause playback while on battery power (issue #1): an opt-in
+    toggle in the applet, off by default. The daemon reads the on-battery
+    state from UPower on the system bus and pauses/resumes accordingly,
+    degrading gracefully where UPower is unavailable.
+  * Fix the applet crashing when its popup is opened: the added settings row
+    pushed the popup past its height limit, tripping an xdg_surface protocol
+    error. The popup height ceiling was raised so all rows fit.
+
+ -- Franz <cosmic-flux-info@franz-net.dev>  Fri, 26 Jun 2026 12:00:00 +0000
+
+cosmic-ext-flux (3.0.0-1) unstable; urgency=medium
+
+  * Automatically pause playback when an app is fullscreen (issue #13):
+    the wallpaper is hidden anyway, so the daemon stops decoding and drops
+    to ~0% CPU, resuming when you leave fullscreen. On by default; toggle
+    in the applet.
+  * Optional "also pause when maximized" toggle in the applet (off by
+    default). A manual pause always takes precedence over auto-resume.
+  * Daemon logs to the systemd journal at info level by default; RUST_LOG
+    still overrides.
+
+ -- Franz <cosmic-flux-info@franz-net.dev>  Thu, 25 Jun 2026 12:00:00 +0000
+
 cosmic-ext-flux (2.0.1-1) unstable; urgency=medium
 
   * Fix postinst systemd handoff under sudo: use systemctl --global enable

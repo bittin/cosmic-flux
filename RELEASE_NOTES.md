@@ -3,14 +3,11 @@
 
 ## Highlights
 
-<!-- Replace with the key changes for this release -->
-- **Fixed: daemon not switched over when upgrading from `cosmic-flux` via sudo.** The post-install script could neither stop the old `cosmic-flux-daemon` nor enable the new unit from a sudo context (no access to the user session bus), leaving the old daemon running from a deleted binary until the next login. The service is now enabled system-wide via `systemctl --global enable`, with a best-effort immediate stop/start for the installing user.
-- If you already upgraded to v2.0.0 and hit this, either log out and back in, or run:
-  ```sh
-  systemctl --user stop cosmic-flux-daemon
-  systemctl --user enable --now cosmic-ext-flux-daemon
-  ```
-- Reminder from v2.0.0: re-add the **Flux** applet to your panel once (the App ID changed) via Settings > Desktop > Panel > Applets. See the [v2.0.0 notes](https://github.com/franz-net/cosmic-ext-flux/releases/tag/v2.0.0) for everything in the rename release.
+This is a bug-fix release. **If the Flux applet crashed when you opened its popup on v3.1.0 or earlier, update to v3.1.1.**
+
+- **Fixed: applet popup crash on some systems (#15).** On certain hardware the applet would die the moment its popup opened, with a Wayland `xdg_surface` "unconfigured_buffer" protocol error — and it happened *regardless* of popup size, so the v3.1.0 height fix didn't cover these users. The real cause was an upstream bug in the pinned `libcosmic` version. This release updates `libcosmic` to a revision that fixes it, with no change to how the applet works.
+
+There are no other behaviour changes from v3.1.0.
 
 ## Install
 
